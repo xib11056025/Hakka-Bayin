@@ -1,575 +1,897 @@
-<!DOCTYPE html>
-<html lang="zh-TW">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>鬧(Now)打八音 APP</title>
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { 
+  BookOpen, Video, Award, Play, CheckCircle, XCircle, RefreshCw, Info, 
+  Upload, Square, Trash2, Volume2, Music, FolderOpen, CheckCircle2, 
+  Scissors, UploadCloud, Sparkles, Sliders, Waves, Wind 
+} from 'lucide-react';
+
+// --- 五聲音階設定 ---
+const PENTATONIC_SCALE = [
+  { label: '高Do', freq: 523.25 }, // C5
+  { label: 'La', freq: 440.00 },   // A4
+  { label: 'Sol', freq: 392.00 },  // G4
+  { label: 'Mi', freq: 329.63 },   // E4
+  { label: 'Re', freq: 293.66 },   // D4
+  { label: 'Do', freq: 261.63 }    // C4
+];
+
+// --- Web Audio API 樂器音效引擎 ---
+const AudioEngine = {
+  ctx: null,
+  customBuffers: {}, 
+  customBaseFreqs: {}, 
+  customSlices: {}, 
+  
+  // 混音總線與效果器
+  masterGain: null,
+  reverbNode: null,
+  dryGain: null,
+  wetGain: null,
+  panners: {},
+
+  init() {
+    if (!this.ctx) {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      
+      // 建立混音總線
+      this.masterGain = this.ctx.createGain();
+      this.dryGain = this.ctx.createGain();
+      this.wetGain = this.ctx.createGain();
+      
+      // 建立空間殘響
+      this.reverbNode = this.ctx.createConvolver();
+      this.reverbNode.buffer = this.createReverbBuffer(this.ctx, 2.5, 3.0); 
+
+      // 路由
+      this.masterGain.connect(this.dryGain);
+      this.masterGain.connect(this.reverbNode);
+      this.reverbNode.connect(this.wetGain);
+      
+      this.dryGain.connect(this.ctx.destination);
+      this.wetGain.connect(this.ctx.destination);
+
+      // 預設效果比例
+      this.wetGain.gain.value = 0.3; 
+      this.dryGain.gain.value = 0.8; 
+    }
+    if (this.ctx.state === 'suspended') {
+      this.ctx.resume();
+    }
+  },
+
+  setReverbLevel(level) {
+    if (this.wetGain) this.wetGain.gain.value = level;
+  },
+
+  createReverbBuffer(ctx, length = 2, decay = 2) {
+    const sampleRate = ctx.sampleRate;
+    const lengthFrames = sampleRate * length;
+    const impulse = ctx.createBuffer(2, lengthFrames, sampleRate);
+    for (let i = 0; i < 2; i++) {
+      const channel = impulse.getChannelData(i);
+      for (let j = 0; j < lengthFrames; j++) {
+        channel[j] = (Math.random() * 2 - 1) * Math.pow(1 - j / lengthFrames, decay);
+      }
+    }
+    return impulse;
+  },
+
+  getPanner(trackId, panValue) {
+    if (!this.panners[trackId]) {
+      const panner = this.ctx.createStereoPanner();
+      panner.pan.value = panValue;
+      panner.connect(this.masterGain); 
+      this.panners[trackId] = panner;
+    }
+    return this.panners[trackId];
+  },
+
+  autoCorrelate(buffer, sampleRate) {
+    const SIZE = Math.min(buffer.length, 8192); 
+    let rms = 0;
+    for (let i = 0; i < SIZE; i++) rms += buffer[i] * buffer[i];
+    rms = Math.sqrt(rms / SIZE);
+    if (rms < 0.01) return -1; 
+
+    let r1 = 0, r2 = SIZE - 1, thres = 0.2;
+    for (let i = 0; i < SIZE / 2; i++) if (Math.abs(buffer[i]) < thres) { r1 = i; break; }
+    for (let i = 1; i < SIZE / 2; i++) if (Math.abs(buffer[SIZE - i]) < thres) { r2 = SIZE - i; break; }
     
-    <!-- 引入 Tailwind CSS 進行版面佈局與樣式設計 -->
-    <script src="https://cdn.tailwindcss.com"></script>
+    const buf = buffer.slice(r1, r2);
+    const newSize = buf.length;
+
+    let c = new Array(newSize).fill(0);
+    for (let i = 0; i < newSize; i++) {
+      for (let j = 0; j < newSize - i; j++) c[i] += buf[j] * buf[j + i];
+    }
+    let d = 0;
+    while (c[d] > c[d + 1]) d++;
+    let maxval = -1, maxpos = -1;
+    for (let i = d; i < newSize; i++) {
+      if (c[i] > maxval) { maxval = c[i]; maxpos = i; }
+    }
+    let T0 = maxpos;
+    return sampleRate / T0;
+  },
+
+  async loadSmartSampleFromUrl(trackId, url, isMelodic) {
+    this.init();
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    const arrayBuffer = await response.arrayBuffer();
+    const audioBuffer = await this.ctx.decodeAudioData(arrayBuffer);
     
-    <!-- 引入 Lucide Icons 圖示庫 -->
-    <script src="https://unpkg.com/lucide@latest"></script>
+    if (!this.customSlices[trackId]) this.customSlices[trackId] = {};
+    let notesExtracted = [];
 
-    <style>
-        /* 自訂動畫效果 */
-        .fade-in {
-            animation: fadeIn 0.3s ease-in-out;
+    const data = audioBuffer.getChannelData(0);
+    const sampleRate = audioBuffer.sampleRate;
+
+    let maxAmplitude = 0;
+    for (let i = 0; i < data.length; i++) {
+      const absVal = Math.abs(data[i]);
+      if (absVal > maxAmplitude) maxAmplitude = absVal;
+    }
+
+    if (!isMelodic) {
+      let peakIndex = 0;
+      for (let i = 0; i < data.length; i++) {
+        if (Math.abs(data[i]) >= maxAmplitude * 0.99) { peakIndex = i; break; }
+      }
+      let startIdx = peakIndex;
+      while (startIdx > 0 && Math.abs(data[startIdx]) > maxAmplitude * 0.05) startIdx--;
+      startIdx = Math.max(0, startIdx - Math.floor(sampleRate * 0.02));
+
+      const cleanBuffer = this.ctx.createBuffer(audioBuffer.numberOfChannels, data.length - startIdx, sampleRate);
+      for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
+        cleanBuffer.copyToChannel(audioBuffer.getChannelData(c).slice(startIdx), c);
+      }
+      this.customBuffers[trackId] = cleanBuffer;
+      return { extracted: ['原音入庫'] };
+    }
+
+    const windowSize = Math.floor(sampleRate * 0.05); 
+    let isPlaying = false;
+    let segments = [];
+    let currentStart = 0;
+    const threshold = maxAmplitude * 0.15; 
+
+    for (let i = 0; i < data.length; i += windowSize) {
+      let sum = 0;
+      for (let j = 0; j < windowSize && i + j < data.length; j++) sum += data[i + j] * data[i + j];
+      let rms = Math.sqrt(sum / windowSize);
+
+      if (rms > threshold && !isPlaying) {
+        isPlaying = true;
+        currentStart = i;
+      } else if (rms < threshold / 2 && isPlaying) {
+        isPlaying = false;
+        if (i - currentStart > sampleRate * 0.15) segments.push({ start: currentStart, end: i });
+      }
+    }
+    if (isPlaying && data.length - currentStart > sampleRate * 0.15) {
+      segments.push({ start: currentStart, end: data.length });
+    }
+    if (segments.length === 0) segments = [{ start: 0, end: data.length }];
+
+    segments.forEach(seg => {
+      const sliceData = data.slice(seg.start, seg.end);
+      const freq = this.autoCorrelate(sliceData, sampleRate);
+      
+      if (freq > 50 && freq < 3000) {
+        let closestIdx = -1;
+        let minDiff = Infinity;
+        PENTATONIC_SCALE.forEach((note, idx) => {
+          const diff = Math.abs(Math.log2(freq / note.freq));
+          if (diff < minDiff) { minDiff = diff; closestIdx = idx; }
+        });
+        if (minDiff < 5/12) {
+          const length = seg.end - seg.start;
+          const newBuffer = this.ctx.createBuffer(audioBuffer.numberOfChannels, length, sampleRate);
+          for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
+            newBuffer.copyToChannel(audioBuffer.getChannelData(c).slice(seg.start, seg.end), c);
+          }
+          this.customSlices[trackId][closestIdx] = newBuffer;
+          const label = PENTATONIC_SCALE[closestIdx].label;
+          if (!notesExtracted.includes(label)) notesExtracted.push(label);
         }
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(5px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        /* 隱藏元素 */
-        .hidden-tab { display: none !important; }
-    </style>
-</head>
-<body class="bg-gray-100 font-sans">
-    <div class="flex justify-center min-h-screen">
-        <div class="w-full max-w-md bg-white shadow-xl flex flex-col h-screen overflow-hidden">
-            
-            <!-- Header -->
-            <header class="bg-red-700 text-white p-4 shadow-md flex items-center justify-center relative z-10">
-                <h1 class="text-2xl font-bold tracking-widest">鬧(Now)打八音</h1>
-            </header>
+      }
+    });
 
-            <!-- Main Content Area -->
-            <main class="flex-1 overflow-y-auto bg-[#faf8f5] relative" id="main-content">
-                
-                <!-- 1. 八音介紹 Tab -->
-                <div id="tab-intro" class="p-4 space-y-6 fade-in hidden-tab">
-                    <section class="bg-white p-5 rounded-2xl shadow-sm border border-orange-100">
-                        <h2 class="text-xl font-bold text-red-800 mb-3 flex items-center">
-                            <i data-lucide="info" class="mr-2 w-5 h-5"></i>客家八音是什麼？
-                        </h2>
-                        <p class="text-gray-700 leading-relaxed text-sm">
-                            「八音」原指金、石、絲、竹、匏、土、革、木等八種製作樂器的材料。客家八音是客家人在長期的歷史遷徙中，吸收各地民間音樂精華，結合自身語言特色所發展出的獨特器樂合奏。無論是迎神賽會、婚喪喜慶，都能聽到這熱鬧（鬧熱）的聲音。
-                        </p>
-                    </section>
+    const firstSegmentLength = segments[0].end - segments[0].start;
+    const cleanFallbackBuffer = this.ctx.createBuffer(audioBuffer.numberOfChannels, firstSegmentLength, sampleRate);
+    for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
+      cleanFallbackBuffer.copyToChannel(audioBuffer.getChannelData(c).slice(segments[0].start, segments[0].end), c);
+    }
+    this.customBuffers[trackId] = cleanFallbackBuffer;
+    this.customBaseFreqs[trackId] = this.autoCorrelate(data.slice(segments[0].start, segments[0].end), sampleRate) || 261.63;
 
-                    <section>
-                        <h2 class="text-xl font-bold text-red-800 mb-4 px-1">核心樂器介紹</h2>
-                        <div id="instruments-container" class="grid grid-cols-2 gap-3">
-                            <!-- 樂器資料將透過 JS 渲染 -->
-                        </div>
-                    </section>
-                    
-                    <div id="copyright-intro"></div>
-                </div>
+    return { extracted: notesExtracted.length > 0 ? notesExtracted : ['單音 (已變速)'] };
+  },
 
-                <!-- 2. 影音欣賞 Tab -->
-                <div id="tab-media" class="p-4 space-y-5 fade-in hidden-tab">
-                    <div class="bg-red-50 p-4 rounded-xl mb-4">
-                        <h2 class="text-lg font-bold text-red-800 mb-1">影音欣賞</h2>
-                        <p class="text-sm text-red-600">匯集大夥房藝術團、林作長老師等珍貴影音資料，帶您身歷其境。</p>
-                    </div>
-                    
-                    <div id="videos-container" class="space-y-5">
-                        <!-- 影音資料將透過 JS 渲染 -->
-                    </div>
+  playRealSample(trackId, targetFreq, isMelodic, duration = 1.0, pan = 0, velocity = 1.0, startTimeOffset = 0) {
+    if (!this.ctx) return;
+    let bufferToPlay = null;
+    let playbackRate = 1;
 
-                    <div id="copyright-media"></div>
-                </div>
+    if (isMelodic && targetFreq) {
+      const noteIndex = PENTATONIC_SCALE.findIndex(n => n.freq === targetFreq);
+      if (this.customSlices[trackId] && this.customSlices[trackId][noteIndex]) {
+        bufferToPlay = this.customSlices[trackId][noteIndex];
+        playbackRate = 1; 
+      } else if (this.customBuffers[trackId]) {
+        bufferToPlay = this.customBuffers[trackId];
+        const baseFreq = this.customBaseFreqs[trackId] || 261.63;
+        playbackRate = targetFreq / baseFreq;
+      }
+    } else {
+      bufferToPlay = this.customBuffers[trackId];
+    }
 
-                <!-- 3. 八音達人 Tab -->
-                <div id="tab-master" class="h-full flex flex-col fade-in hidden-tab">
-                    <div class="flex bg-white shadow-sm shrink-0">
-                        <button onclick="switchMasterSubTab('quiz')" id="subtab-quiz-btn" class="flex-1 py-3 text-sm font-bold border-b-2 border-red-600 text-red-600 transition-colors">知識小測驗</button>
-                        <button onclick="switchMasterSubTab('game')" id="subtab-game-btn" class="flex-1 py-3 text-sm font-bold border-b-2 border-transparent text-gray-500 transition-colors">音樂拼接遊戲</button>
-                    </div>
+    if (!bufferToPlay) return;
 
-                    <div class="flex-1 overflow-y-auto relative">
-                        <!-- 知識測驗區塊 -->
-                        <div id="subtab-quiz" class="h-full"></div>
-                        <!-- 音樂遊戲區塊 -->
-                        <div id="subtab-game" class="hidden-tab h-full p-5 flex flex-col items-center">
-                            <div class="mb-6 text-center">
-                                <h2 class="text-xl font-bold text-gray-800 mb-2">簡易音樂拼接</h2>
-                                <p class="text-xs text-gray-500">點擊格子創造你的八音旋律，然後按下播放！</p>
-                            </div>
-                            <div class="bg-white p-4 rounded-2xl shadow-sm border border-gray-100 mb-6 w-full max-w-[300px]">
-                                <div id="music-grid" class="grid gap-2" style="grid-template-columns: repeat(5, minmax(0, 1fr))">
-                                    <!-- 網格將由 JS 渲染 -->
-                                </div>
-                            </div>
-                            <div class="flex gap-4">
-                                <button id="play-music-btn" onclick="toggleMusicPlay()" class="px-8 py-3 rounded-full font-bold flex items-center text-white bg-green-500">
-                                    <i data-lucide="play" class="mr-2 w-5 h-5"></i> 播放
-                                </button>
-                                <button onclick="clearMusicGrid()" class="px-6 py-3 rounded-full font-bold flex items-center bg-gray-200 text-gray-700 hover:bg-gray-300">
-                                    <i data-lucide="refresh-cw" class="mr-2 w-5 h-5"></i> 清除
-                                </button>
-                            </div>
-                            <div class="mt-8 text-xs text-gray-400">素材概念參考: Chrome Music Lab</div>
-                        </div>
-                    </div>
-                </div>
+    const source = this.ctx.createBufferSource();
+    const gainNode = this.ctx.createGain();
+    const pannerNode = this.getPanner(trackId, pan);
 
-            </main>
+    source.buffer = bufferToPlay;
+    source.playbackRate.value = playbackRate;
 
-            <!-- Bottom Navigation -->
-            <nav class="bg-white border-t border-gray-200 flex justify-around p-2 pb-6 z-10 shrink-0">
-                <button onclick="switchTab('intro')" id="nav-intro" class="flex flex-col items-center justify-center p-2 w-full text-red-700 transition-colors">
-                    <i data-lucide="book-open"></i>
-                    <span class="text-xs mt-1 font-medium">八音介紹</span>
-                </button>
-                <button onclick="switchTab('media')" id="nav-media" class="flex flex-col items-center justify-center p-2 w-full text-gray-400 hover:text-red-500 transition-colors">
-                    <i data-lucide="video"></i>
-                    <span class="text-xs mt-1 font-medium">影音欣賞</span>
-                </button>
-                <button onclick="switchTab('master')" id="nav-master" class="flex flex-col items-center justify-center p-2 w-full text-gray-400 hover:text-red-500 transition-colors">
-                    <i data-lucide="award"></i>
-                    <span class="text-xs mt-1 font-medium">八音達人</span>
-                </button>
-            </nav>
+    const attack = isMelodic ? 0.08 : 0.01;
+    const release = isMelodic ? 0.35 : 0.15; 
+    const actualStartTime = this.ctx.currentTime + startTimeOffset;
 
-        </div>
+    gainNode.gain.setValueAtTime(0, actualStartTime);
+    gainNode.gain.linearRampToValueAtTime(velocity, actualStartTime + attack);
+    gainNode.gain.setValueAtTime(velocity, actualStartTime + Math.max(attack, duration - release));
+    gainNode.gain.linearRampToValueAtTime(0.001, actualStartTime + duration + release);
+
+    source.connect(gainNode);
+    gainNode.connect(pannerNode);
+
+    source.start(actualStartTime);
+    source.stop(actualStartTime + duration + release + 0.1);
+  },
+
+  playSynth(type, freq, duration, pan, velocity, startTimeOffset) {
+     if(!this.ctx) return;
+     const osc = this.ctx.createOscillator();
+     const gainNode = this.ctx.createGain();
+     const pannerNode = this.getPanner('synth', pan);
+     osc.type = type; osc.frequency.setValueAtTime(freq || 200, this.ctx.currentTime + startTimeOffset);
+     const actualStartTime = this.ctx.currentTime + startTimeOffset;
+     gainNode.gain.setValueAtTime(0, actualStartTime);
+     gainNode.gain.linearRampToValueAtTime(velocity * 0.5, actualStartTime + 0.05);
+     gainNode.gain.exponentialRampToValueAtTime(0.001, actualStartTime + duration);
+     osc.connect(gainNode); gainNode.connect(pannerNode);
+     osc.start(actualStartTime); osc.stop(actualStartTime + duration);
+  }
+};
+
+const playTrack = (track, freq, dur, velocity = 1.0, timeOffset = 0) => {
+  if (AudioEngine.customBuffers[track.id] || (AudioEngine.customSlices[track.id] && Object.keys(AudioEngine.customSlices[track.id]).length > 0)) {
+    AudioEngine.playRealSample(track.id, freq, track.isMelodic, dur, track.pan, velocity, timeOffset);
+  } else {
+    AudioEngine.playSynth('sine', freq, dur, track.pan, velocity, timeOffset);
+  }
+};
+
+const TRACKS = [
+  { id: 'bigGong', name: '大鑼', isMelodic: false, pan: 0.0, color: 'bg-amber-700', activeColor: 'bg-amber-600', play: function(f,d,v,t){playTrack(this, f, d, v, t)} },
+  { id: 'smallGong', name: '小鑼', isMelodic: false, pan: 0.3, color: 'bg-amber-500', activeColor: 'bg-amber-400', play: function(f,d,v,t){playTrack(this, f, d, v, t)} },
+  { id: 'dingDang', name: '叮噹', isMelodic: false, pan: -0.4, color: 'bg-yellow-500', activeColor: 'bg-yellow-400', play: function(f,d,v,t){playTrack(this, f, d, v, t)} },
+  { id: 'bo', name: '鈸', isMelodic: false, pan: 0.5, color: 'bg-orange-500', activeColor: 'bg-orange-400', play: function(f,d,v,t){playTrack(this, f, d, v, t)} },
+  { id: 'tanggu', name: '堂鼓', isMelodic: false, pan: -0.2, color: 'bg-red-700', activeColor: 'bg-red-600', play: function(f,d,v,t){playTrack(this, f, d, v, t)} },
+  { id: 'bangziLow', name: '梆子(低)', isMelodic: false, pan: -0.6, color: 'bg-stone-700', activeColor: 'bg-stone-600', play: function(f,d,v,t){playTrack(this, f, d, v, t)} },
+  { id: 'bangziHigh', name: '梆子(高)', isMelodic: false, pan: -0.5, color: 'bg-stone-500', activeColor: 'bg-stone-400', play: function(f,d,v,t){playTrack(this, f, d, v, t)} },
+  { id: 'recorder', name: '直笛', isMelodic: true, pan: 0.6, color: 'bg-emerald-600', activeColor: 'bg-emerald-500', play: function(f,d,v,t){playTrack(this, f, d, v, t)} },
+  { id: 'panghu', name: '胖胡', isMelodic: true, pan: -0.5, color: 'bg-rose-600', activeColor: 'bg-rose-500', play: function(f,d,v,t){playTrack(this, f, d, v, t)} },
+  { id: 'yehu', name: '椰胡', isMelodic: true, pan: 0.4, color: 'bg-cyan-600', activeColor: 'bg-cyan-500', play: function(f,d,v,t){playTrack(this, f, d, v, t)} },
+  { id: 'suonaLow', name: '嗩吶(低)', isMelodic: true, pan: -0.3, color: 'bg-orange-600', activeColor: 'bg-orange-500', play: function(f,d,v,t){playTrack(this, f, d, v, t)} },
+  { id: 'suonaHigh', name: '嗩吶(高)', isMelodic: true, pan: 0.2, color: 'bg-yellow-600', activeColor: 'bg-yellow-500', play: function(f,d,v,t){playTrack(this, f, d, v, t)} },
+];
+
+const STEPS = 16;
+
+const DEFAULT_GRID = [
+  [true, null, null, null, true, null, null, null, true, null, null, null, true, null, null, null], 
+  [null, null, true, null, null, null, true, null, null, null, true, null, null, null, true, null], 
+  [null, true, null, true, null, true, null, true, null, true, null, true, null, true, null, true], 
+  [null, null, null, null, true, null, null, null, null, null, null, null, true, null, null, null], 
+  [true, null, null, true, null, true, null, null, true, null, null, true, null, true, null, null], 
+  [null, true, null, null, true, null, true, null, null, true, null, null, true, null, true, null], 
+  [true, null, true, null, null, true, null, true, true, null, true, null, null, true, null, true], 
+  [2, null, 3, null, 2, null, 1, null, 0, null, 1, null, 2, null, 3, null], 
+  [2, 'tie', 'tie', 'tie', 2, 'tie', 'tie', 'tie', 0, 'tie', 'tie', 'tie', 2, 'tie', 'tie', 'tie'], 
+  [null, 2, null, 2, null, 1, null, 1, null, 0, null, 0, null, 2, null, 2], 
+  [2, null, null, null, null, null, null, null, 3, null, null, null, null, null, null, null], 
+  [2, null, 3, 4, 2, null, 1, 2, 0, null, 1, 2, 2, null, 3, 4], 
+];
+
+const AUDIO_FILES = {
+  bigGong: './audio/大鑼.m4a',
+  smallGong: './audio/小鑼.m4a',
+  dingDang: './audio/叮噹.m4a',
+  bo: './audio/鈸.m4a',
+  tanggu: './audio/堂鼓.m4a',
+  bangziLow: './audio/梆子 (低).m4a',
+  bangziHigh: './audio/梆子 (高).m4a',
+  recorder: './audio/直笛音階從C開始.m4a',
+  panghu: './audio/胖胡音階從B開始.m4a',
+  yehu: './audio/椰胡音階從C開始.m4a',
+  suonaLow: './audio/嗩吶音階從G開始（低八度）.m4a',
+  suonaHigh: './audio/嗩吶音階從G開始（高八度）.m4a',
+};
+
+const instruments = [
+  { id: 1, name: '嗩吶', type: '管樂', desc: '客家八音的靈魂與主奏樂器，音色高亢明亮，常擔任「頭手」帶領樂團。', img: 'https://www.hakka-portal.ntpc.gov.tw/archive/article/8/normal/part_623_4412158_94710.jpg' },
+  { id: 2, name: '胖胡 (大廣弦)', type: '擦弦', desc: '音色低沉渾厚，共鳴箱較大，是八音絃索音樂中重要的伴奏樂器。', img: 'https://images.unsplash.com/photo-1621516246062-8e72750a97c9?w=500&q=80' }, 
+  { id: 3, name: '揚琴', type: '擊弦', desc: '音色清脆如珠落玉盤，能在合奏中發揮融合與豐富和聲的作用。', img: 'https://images.unsplash.com/photo-1542704792-e30dac463c90?w=500&q=80' }, 
+  { id: 4, name: '堂鼓與銅器', type: '打擊', desc: '包含堂鼓、小鈸、大鑼等，是控制樂曲節奏與氣氛的骨幹。', img: 'https://images.unsplash.com/photo-1519892300165-cb5542fb47c7?w=500&q=80' } 
+];
+
+const videos = [
+  { id: 'v2', title: '傳統吹場音樂欣賞', source: '六堆八音傳藝', type: 'youtube', url: 'https://www.youtube.com/embed/dQw4w9WgXcQ', ytUrl: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' },
+  { id: 'v3', title: '林作長老師 - 八音示範', source: '雲端影音', type: 'youtube', url: 'https://www.youtube.com/embed/acNuUWgdl5Q', ytUrl: 'https://www.youtube.com/watch?v=acNuUWgdl5Q' }
+];
+
+const quizQuestions = [
+  { q: "客家八音中的「八音」原指什麼？", options: ["八種不同的樂器", "金、石、絲、竹、匏、土、革、木等八種製作材料", "八個不同的音階", "八種傳統曲調"], ans: 1 },
+  { q: "傳統客家八音演奏形式主要分為哪兩種？", options: ["吹場音樂、絃索音樂", "獨奏、合奏", "文場、武場", "山歌、採茶戲"], ans: 0 },
+  { q: "下列哪一種樂器不屬於客家八音常用的樂器？", options: ["嗩吶", "胖胡 (大廣弦)", "鋼琴", "堂鼓"], ans: 2 },
+  { q: "在客家人的生命禮俗中，哪個場合最常聽到客家八音？", options: ["婚喪喜慶及廟會慶典", "學校升旗典禮", "睡前搖籃曲", "流行音樂演唱會"], ans: 0 },
+];
+
+const playTone = (frequency, type = 'sine') => {
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContext) return;
+  const ctx = new AudioContext();
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = type;
+  osc.frequency.value = frequency;
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start();
+  gain.gain.exponentialRampToValueAtTime(0.00001, ctx.currentTime + 0.5);
+  osc.stop(ctx.currentTime + 0.5);
+};
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState('intro'); // 'intro', 'media', 'master'
+
+  return (
+    <div className="flex justify-center bg-gray-100 min-h-screen font-sans">
+      <div className="w-full max-w-md bg-white shadow-xl flex flex-col h-screen overflow-hidden">
+        
+        {/* Header */}
+        <header className="bg-red-700 text-white p-4 shadow-md flex items-center justify-center relative z-20">
+          <h1 className="text-2xl font-bold tracking-widest">鬧(Now)打八音</h1>
+        </header>
+
+        {/* Main Content Area */}
+        <main className="flex-1 overflow-y-auto bg-[#faf8f5] relative">
+          {activeTab === 'intro' && <IntroScreen />}
+          {activeTab === 'media' && <MediaScreen />}
+          {activeTab === 'master' && <MasterScreen />}
+        </main>
+
+        {/* Bottom Navigation */}
+        <nav className="bg-white border-t border-gray-200 flex justify-around p-2 pb-6 z-20">
+          <NavItem icon={<BookOpen size={24}/>} label="八音介紹" active={activeTab === 'intro'} onClick={() => setActiveTab('intro')} />
+          <NavItem icon={<Video size={24}/>} label="影音欣賞" active={activeTab === 'media'} onClick={() => setActiveTab('media')} />
+          <NavItem icon={<Award size={24}/>} label="八音實作" active={activeTab === 'master'} onClick={() => setActiveTab('master')} />
+        </nav>
+      </div>
     </div>
+  );
+}
 
-    <!-- 應用程式邏輯 (JavaScript) -->
-    <script>
-        // --- 資料庫 ---
-        const instruments = [
-            { id: 1, name: '嗩吶', type: '管樂', desc: '客家八音的靈魂與主奏樂器，音色高亢明亮，常擔任「頭手」帶領樂團。', img: 'https://www.hakka-portal.ntpc.gov.tw/archive/article/8/normal/part_623_4412158_94710.jpg' },
-            { id: 2, name: '胖胡 (大廣弦)', type: '擦弦', desc: '音色低沉渾厚，共鳴箱較大，是八音絃索音樂中重要的伴奏樂器。', img: 'https://images.unsplash.com/photo-1621516246062-8e72750a97c9?w=500&q=80' },
-            { id: 3, name: '揚琴', type: '擊弦', desc: '音色清脆如珠落玉盤，能在合奏中發揮融合與豐富和聲的作用。', img: 'https://images.unsplash.com/photo-1542704792-e30dac463c90?w=500&q=80' },
-            { id: 4, name: '堂鼓與銅器', type: '打擊', desc: '包含堂鼓、小鈸、大鑼等，是控制樂曲節奏與氣氛的骨幹。', img: 'https://images.unsplash.com/photo-1519892300165-cb5542fb47c7?w=500&q=80' }
-        ];
+function NavItem({ icon, label, active, onClick }) {
+  return (
+    <button 
+      onClick={onClick}
+      className={`flex flex-col items-center justify-center p-2 w-full transition-colors ${active ? 'text-red-700' : 'text-gray-400 hover:text-red-500'}`}
+    >
+      {icon}
+      <span className="text-xs mt-1 font-medium">{label}</span>
+    </button>
+  );
+}
 
-        const videos = [
-            { id: 'v1', title: '客家八音基礎認識', source: '大夥房藝術團', type: 'youtube', url: 'https://drive.google.com/file/d/1YUZ0QmpopWwVPPmC-mI88qD7XBAeweV7/preview', ytUrl: 'https://drive.google.com/file/d/1YUZ0QmpopWwVPPmC-mI88qD7XBAeweV7/view?usp=drive_link' }, 
-            { id: 'v2', title: '傳統吹場音樂欣賞', source: '六堆八音傳藝', type: 'youtube', url: 'https://www.youtube.com/embed/dQw4w9WgXcQ', ytUrl: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' },
-            { id: 'v3', title: '林作長老師 - 八音示範', source: '雲端影音', type: 'youtube', url: 'https://www.youtube.com/embed/acNuUWgdl5Q', ytUrl: 'https://www.youtube.com/watch?v=acNuUWgdl5Q' }
-        ];
+function IntroScreen() {
+  return (
+    <div className="p-4 space-y-6 animate-fade-in">
+      <section className="bg-white p-5 rounded-2xl shadow-sm border border-orange-100">
+        <h2 className="text-xl font-bold text-red-800 mb-3 flex items-center"><Info className="mr-2" size={20}/>客家八音是什麼？</h2>
+        <p className="text-gray-700 leading-relaxed text-sm">
+          「八音」原指金、石、絲、竹、匏、土、革、木等八種製作樂器的材料。客家八音是客家人在長期的歷史遷徙中，吸收各地民間音樂精華，結合自身語言特色所發展出的獨特器樂合奏。
+        </p>
+      </section>
 
-        const quizQuestions = [
-            { q: "客家八音中的「八音」原指什麼？", options: ["八種不同的樂器", "金、石、絲、竹、匏、土、革、木等八種製作樂器的材料", "八個不同的音階", "八種客家傳統曲調"], ans: 1 },
-            { q: "傳統客家八音演奏形式主要分為哪兩種？", options: ["吹場音樂、絃索音樂", "獨奏、合奏", "文場、武場", "山歌、採茶戲"], ans: 0 },
-            { q: "下列哪一種樂器不屬於客家八音常用的樂器？", options: ["嗩吶", "胖胡 (大廣弦)", "鋼琴", "堂鼓"], ans: 2 },
-            { q: "客家八音中，常擔任主旋律帶領樂團的「頭手」主要演奏哪種樂器？", options: ["揚琴", "椰胡", "嗩吶", "小鈸"], ans: 2 },
-            { q: "在客家人的生命禮俗中，哪個場合最常聽到客家八音？", options: ["婚喪喜慶及廟會慶典", "學校升旗典禮", "睡前搖籃曲", "流行音樂演唱會"], ans: 0 },
-            { q: "「六堆」地區的客家八音發展具有地方特色，請問「六堆」位於台灣的哪個區域？", options: ["桃竹苗地區", "高屏地區", "花東地區", "雲嘉南地區"], ans: 1 },
-            { q: "胖胡（大廣弦）在客家八音中屬於哪一類樂器？", options: ["吹管樂器", "打擊樂器", "撥弦樂器", "擦弦樂器 (絲)"], ans: 3 },
-            { q: "台灣客家八音常用的打擊樂器（敲擊）中，通常不包含下列何者？", options: ["堂鼓", "爵士鼓", "小鈸", "大鑼"], ans: 1 },
-            { q: "「吹場音樂」通常在什麼時候演奏？", options: ["迎神、祭祀等莊嚴熱鬧場合", "室內喝茶聊天時", "歌仔戲伴奏時", "現代舞蹈表演中"], ans: 0 },
-            { q: "學習客家八音最傳統的方式通常是透過何種途徑？", options: ["出國留學", "口傳心授與家族/師徒傳承", "線上購買函授課程", "看樂譜自學"], ans: 1 }
-        ];
-
-        // --- 全域變數狀態 ---
-        let localVideoSrc = null;
-        let videoError = false;
-
-        // 測驗狀態
-        let currentQ = 0;
-        let score = 0;
-        let showResult = false;
-        let selectedOpt = null;
-        let isAnswered = false;
-
-        // 音樂拼接遊戲狀態
-        const rows = 5;
-        const cols = 5;
-        let grid = Array(rows).fill().map(() => Array(cols).fill(false));
-        let isPlaying = false;
-        let currentCol = 0;
-        let musicInterval;
-        const notes = [880, 783.99, 659.25, 587.33, 523.25]; // A5, G5, E5, D5, C5
-
-        // --- 發聲輔助函式 ---
-        const playTone = (frequency, type = 'sine') => {
-            const AudioContext = window.AudioContext || window.webkitAudioContext;
-            if (!AudioContext) return;
-            const ctx = new AudioContext();
-            const osc = ctx.createOscillator();
-            const gain = ctx.createGain();
-            osc.type = type;
-            osc.frequency.value = frequency;
-            osc.connect(gain);
-            gain.connect(ctx.destination);
-            osc.start();
-            gain.gain.exponentialRampToValueAtTime(0.00001, ctx.currentTime + 0.5);
-            osc.stop(ctx.currentTime + 0.5);
-        };
-
-        // --- UI 更新與渲染函式 ---
-
-        // 產生版權宣告區塊
-        const getCopyrightHTML = () => `
-            <div class="mt-8 mb-4 p-4 border-t border-gray-200 text-xs text-gray-400 text-center leading-relaxed">
-                <p class="font-bold mb-1">版權聲明</p>
-                <p>本APP為課堂教學使用，無商業用途。</p>
-                <p>部分內容取材自吳榮順期刊文章、六堆八音傳藝雜誌、新北市客家文化典藏資料庫、大夥房藝術團等公開網路、紙本出版品或網站，版權屬原作者所有。</p>
+      <section>
+        <h2 className="text-xl font-bold text-red-800 mb-4 px-1">核心樂器介紹</h2>
+        <div className="grid grid-cols-2 gap-3">
+          {instruments.map(inst => (
+            <div key={inst.id} className="bg-white rounded-xl shadow-sm overflow-hidden border border-gray-100 flex flex-col">
+              <div className="h-28 bg-gray-200 relative">
+                <img src={inst.img} alt={inst.name} className="w-full h-full object-cover mix-blend-multiply" />
+                <span className="absolute top-2 right-2 bg-black/50 text-white text-xs px-2 py-1 rounded-full">{inst.type}</span>
+              </div>
+              <div className="p-3 flex-1 flex flex-col">
+                <h3 className="font-bold text-gray-800 mb-1 text-sm">{inst.name}</h3>
+                <p className="text-xs text-gray-500 line-clamp-3 mb-2">{inst.desc}</p>
+                <button 
+                  onClick={() => playTone(inst.id * 200 + 300, 'square')} 
+                  className="mt-auto pt-2 text-red-600 flex items-center text-xs font-bold hover:text-red-800 border-t border-gray-100"
+                >
+                  <Play size={14} className="mr-1"/> 試聽音色
+                </button>
+              </div>
             </div>
-        `;
+          ))}
+        </div>
+      </section>
+      <Copyright />
+    </div>
+  );
+}
 
-        // 初始化八音介紹
-        function initIntro() {
-            const container = document.getElementById('instruments-container');
-            container.innerHTML = instruments.map(inst => `
-                <div class="bg-white rounded-xl shadow-sm overflow-hidden border border-gray-100 flex flex-col">
-                    <div class="h-28 bg-gray-200 relative">
-                        <img src="${inst.img}" alt="${inst.name}" class="w-full h-full object-cover mix-blend-multiply" />
-                        <span class="absolute top-2 right-2 bg-black/50 text-white text-xs px-2 py-1 rounded-full">${inst.type}</span>
-                    </div>
-                    <div class="p-3 flex-1 flex flex-col">
-                        <h3 class="font-bold text-gray-800 mb-1">${inst.name}</h3>
-                        <p class="text-xs text-gray-500 line-clamp-3">${inst.desc}</p>
-                        <button onclick="playTone(${inst.id * 200 + 300}, 'square')" class="mt-auto pt-2 text-red-600 flex items-center text-xs font-bold hover:text-red-800">
-                            <i data-lucide="play" class="mr-1 w-3.5 h-3.5"></i> 試聽音色
+function MediaScreen() {
+  const [localVideoSrc, setLocalVideoSrc] = useState(null);
+  const [videoError, setVideoError] = useState(false);
+
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      const url = URL.createObjectURL(file);
+      setLocalVideoSrc(url);
+      setVideoError(false);
+    }
+  };
+
+  return (
+    <div className="p-4 space-y-5 animate-fade-in">
+      <div className="bg-red-50 p-4 rounded-xl mb-4 border border-red-100">
+        <h2 className="text-lg font-bold text-red-800 mb-1">影音欣賞</h2>
+        <p className="text-sm text-red-600">匯集大夥房藝術團、林作長老師等珍貴影音資料，帶您身歷其境。</p>
+      </div>
+
+      {videos.map(video => (
+        <div key={video.id} className="bg-white rounded-xl shadow-sm overflow-hidden border border-gray-100">
+          <div className="aspect-video bg-gray-900 w-full relative">
+             {video.type === 'youtube' ? (
+               <iframe 
+                 className="absolute top-0 left-0 w-full h-full"
+                 src={video.url} 
+                 title={video.title}
+                 frameBorder="0" 
+                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" 
+                 allowFullScreen
+               ></iframe>
+             ) : null}
+          </div>
+          <div className="p-4 flex flex-col space-y-2">
+            <h3 className="font-bold text-gray-800 text-sm">{video.title}</h3>
+            <div className="flex justify-between items-center">
+              <span className="inline-block bg-gray-100 text-gray-600 text-[10px] px-2 py-1 rounded">來源: {video.source}</span>
+            </div>
+          </div>
+        </div>
+      ))}
+      <Copyright />
+    </div>
+  );
+}
+
+function MasterScreen() {
+  const [subTab, setSubTab] = useState('game'); // 預設開啟遊戲
+
+  return (
+    <div className="h-full flex flex-col animate-fade-in bg-stone-100">
+      <div className="flex bg-white shadow-sm z-10 sticky top-0">
+        <button onClick={() => setSubTab('game')} className={`flex-1 py-3 text-sm font-bold border-b-2 transition-colors ${subTab === 'game' ? 'border-red-600 text-red-600' : 'border-transparent text-gray-500'}`}>進階合奏編排</button>
+        <button onClick={() => setSubTab('quiz')} className={`flex-1 py-3 text-sm font-bold border-b-2 transition-colors ${subTab === 'quiz' ? 'border-red-600 text-red-600' : 'border-transparent text-gray-500'}`}>知識小測驗</button>
+      </div>
+
+      <div className="flex-1 overflow-y-auto">
+        {subTab === 'quiz' && <QuizGame />}
+        {subTab === 'game' && <AdvancedMusicGame />}
+      </div>
+    </div>
+  );
+}
+
+function AdvancedMusicGame() {
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [bpm, setBpm] = useState(105);
+  const [currentStep, setCurrentStep] = useState(0);
+  const [selectedTool, setSelectedTool] = useState(2); 
+  const [grid, setGrid] = useState(DEFAULT_GRID);
+  
+  const [reverbLevel, setReverbLevel] = useState(0.4); 
+  const [humanize, setHumanize] = useState(true); 
+  
+  const [loadedTracks, setLoadedTracks] = useState({});
+  const [isProcessing, setIsProcessing] = useState(false);
+  
+  const timerRef = useRef(null);
+  const currentStepRef = useRef(0);
+  const isPlayingRef = useRef(false);
+
+  const handleUserInteraction = () => { AudioEngine.init(); };
+
+  useEffect(() => {
+    AudioEngine.setReverbLevel(reverbLevel);
+  }, [reverbLevel]);
+
+  const loadLocalAudioFiles = async () => {
+    setIsProcessing(true);
+    handleUserInteraction();
+    
+    let updatedStatus = { ...loadedTracks };
+
+    for (const track of TRACKS) {
+      try {
+        const url = AUDIO_FILES[track.id];
+        if (url) {
+          const result = await AudioEngine.loadSmartSampleFromUrl(track.id, url, track.isMelodic);
+          updatedStatus[track.id] = { loaded: true, notes: result.extracted };
+        }
+      } catch (err) {
+        console.error(`檔案 ${track.name} 載入失敗`, err);
+      }
+    }
+    
+    setLoadedTracks(updatedStatus);
+    setIsProcessing(false);
+  };
+
+  const toggleCell = (trackIndex, stepIndex) => {
+    handleUserInteraction();
+    const newGrid = [...grid];
+    newGrid[trackIndex] = [...newGrid[trackIndex]];
+    const track = TRACKS[trackIndex];
+    const currentVal = newGrid[trackIndex][stepIndex];
+
+    if (track.isMelodic) {
+      if (currentVal === selectedTool) {
+        newGrid[trackIndex][stepIndex] = null; 
+      } else {
+        newGrid[trackIndex][stepIndex] = selectedTool;
+        if (selectedTool !== 'tie') {
+          track.play(PENTATONIC_SCALE[selectedTool].freq, 0.5, 1.0, 0); 
+        }
+      }
+    } else {
+      if (currentVal) {
+        newGrid[trackIndex][stepIndex] = null;
+      } else {
+        newGrid[trackIndex][stepIndex] = true;
+        track.play(null, 0.5, 1.0, 0); 
+      }
+    }
+    setGrid(newGrid);
+  };
+
+  const clearGrid = () => {
+    setGrid(Array.from({ length: TRACKS.length }, () => Array(STEPS).fill(null)));
+    setCurrentStep(0);
+    currentStepRef.current = 0;
+    if (isPlaying) togglePlay();
+  };
+
+  const loadExample = () => {
+    setGrid(DEFAULT_GRID);
+    setCurrentStep(0);
+    currentStepRef.current = 0;
+    if (isPlaying) togglePlay();
+  };
+
+  const playStep = useCallback((step) => {
+    const stepDurationSec = (60000 / bpm / 4) / 1000;
+
+    TRACKS.forEach((track, trackIndex) => {
+      const cellValue = grid[trackIndex][step];
+      
+      if (cellValue !== null && cellValue !== 'tie') {
+        let tieCount = 0;
+        for (let i = 1; i < STEPS; i++) {
+          if (grid[trackIndex][(step + i) % STEPS] === 'tie') { tieCount++; } else { break; }
+        }
+        const totalDuration = stepDurationSec * (1 + tieCount);
+
+        const humanizeOffset = humanize ? (Math.random() * 0.03 - 0.015) : 0;
+        const velocity = humanize ? (0.8 + Math.random() * 0.2) : 1.0;
+
+        if (track.isMelodic) {
+          track.play(PENTATONIC_SCALE[cellValue].freq, totalDuration, velocity, humanizeOffset);
+        } else {
+          track.play(null, totalDuration, velocity, humanizeOffset); 
+        }
+      }
+    });
+  }, [grid, bpm, humanize]);
+
+  const togglePlay = () => {
+    handleUserInteraction();
+    if (isPlaying) {
+      setIsPlaying(false);
+      isPlayingRef.current = false;
+      clearInterval(timerRef.current);
+      setCurrentStep(0);
+      currentStepRef.current = 0;
+    } else {
+      setIsPlaying(true);
+      isPlayingRef.current = true;
+      const stepDuration = (60000 / bpm) / 4;
+      timerRef.current = setInterval(() => {
+        playStep(currentStepRef.current);
+        setCurrentStep(currentStepRef.current);
+        currentStepRef.current = (currentStepRef.current + 1) % STEPS;
+      }, stepDuration);
+    }
+  };
+
+  useEffect(() => {
+    if (isPlayingRef.current) {
+      clearInterval(timerRef.current);
+      const stepDuration = (60000 / bpm) / 4;
+      timerRef.current = setInterval(() => {
+        playStep(currentStepRef.current);
+        setCurrentStep(currentStepRef.current);
+        currentStepRef.current = (currentStepRef.current + 1) % STEPS;
+      }, stepDuration);
+    }
+    return () => clearInterval(timerRef.current);
+  }, [bpm, playStep]);
+
+  return (
+    <div className="p-2 pb-10 space-y-4 font-sans text-stone-800" onClick={handleUserInteraction}>
+      
+      {/* 區塊 1：音檔管理 */}
+      <section className="bg-white p-4 rounded-xl border border-stone-200 shadow-sm relative">
+        {isProcessing && (
+          <div className="absolute inset-0 bg-white/80 backdrop-blur-sm z-20 flex items-center justify-center rounded-xl">
+            <div className="bg-indigo-600 text-white px-4 py-2 rounded-full font-bold shadow-lg animate-pulse flex items-center gap-2 text-sm">
+              <Scissors size={16} className="animate-spin" /> 正在載入與分析本機音檔...
+            </div>
+          </div>
+        )}
+        
+        <div className="flex flex-col gap-2 mb-2 border-b border-stone-100 pb-3">
+          <div className="flex justify-between items-center">
+            <h2 className="text-base font-bold text-indigo-900 flex items-center gap-2">
+              <FolderOpen size={20} className="text-indigo-600" /> 1. 樂器音色庫
+            </h2>
+            <button 
+              onClick={loadLocalAudioFiles} 
+              className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-1.5 px-3 rounded-lg shadow active:scale-95 transition-all text-xs flex items-center gap-1"
+            >
+              <UploadCloud size={14} /> 讀取 ./audio 檔案
+            </button>
+          </div>
+          <p className="text-xs text-stone-500">從伺服器 audio 資料夾自動載入對應的 .m4a 樂器音檔。</p>
+        </div>
+
+        <div className="grid grid-cols-4 gap-2">
+          {TRACKS.map(track => {
+            const isLoaded = loadedTracks[track.id];
+            return (
+              <div key={`status-${track.id}`} className={`flex items-center justify-center gap-1 p-1.5 rounded-lg border text-[10px] font-bold ${isLoaded ? 'bg-indigo-50 border-indigo-400 text-indigo-800' : 'bg-stone-50 border-stone-200 text-stone-400'}`}>
+                {isLoaded ? <CheckCircle2 size={12} className="text-emerald-500" /> : <span className="w-3 h-3 rounded-full border border-stone-300"></span>}
+                {track.name}
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* 區塊 2：合奏編排 (含水平滾動) */}
+      <section className="bg-white p-3 rounded-xl border border-stone-200 shadow-sm">
+        <div className="flex justify-between items-center mb-3">
+          <h2 className="text-base font-bold text-stone-700 flex items-center gap-2">
+            <Music size={18} className="text-stone-500" /> 2. 譜曲編排
+          </h2>
+        </div>
+        
+        {/* 畫筆工具列 */}
+        <div className="bg-stone-50 p-2 rounded-lg border border-stone-200 mb-3 flex overflow-x-auto hide-scrollbar gap-1">
+          {PENTATONIC_SCALE.map((pitch, index) => (
+            <button
+              key={`pitch-${index}`}
+              onClick={() => setSelectedTool(index)}
+              className={`flex-shrink-0 px-2 py-1 rounded text-xs font-bold transition-all ${selectedTool === index ? 'bg-blue-600 text-white shadow' : 'bg-white text-stone-600 border border-stone-200'}`}
+            >
+              {pitch.label}
+            </button>
+          ))}
+          <div className="w-px h-6 bg-stone-300 mx-1 flex-shrink-0"></div>
+          <button onClick={() => setSelectedTool('tie')} className={`flex-shrink-0 px-2 py-1 rounded text-xs font-bold transition-all ${selectedTool === 'tie' ? 'bg-indigo-600 text-white shadow' : 'bg-white text-indigo-700 border border-indigo-200'}`}>
+            延音(—)
+          </button>
+        </div>
+
+        {/* 橫向捲動的編排網格 */}
+        <div className="overflow-x-auto pb-2 -mx-1 px-1">
+          <div className="min-w-[600px] space-y-1">
+            {TRACKS.map((track, trackIndex) => {
+              const hasCustomSample = !!loadedTracks[track.id];
+              const trackBaseColor = hasCustomSample ? 'bg-emerald-500' : track.color;
+
+              return (
+                <div key={`track-${track.id}`} className="flex items-center gap-1 group">
+                  <button 
+                    onClick={() => track.play(track.isMelodic ? PENTATONIC_SCALE[2].freq : null, 1.0, 1.0, 0)}
+                    className={`w-16 flex-shrink-0 text-center font-bold text-white text-[10px] px-1 py-1.5 rounded flex items-center justify-center gap-1 shadow-sm active:scale-95 ${trackBaseColor}`}
+                  >
+                    {track.name}
+                  </button>
+                  
+                  <div className="flex-1 flex gap-0.5 bg-stone-100 p-1 rounded border border-stone-200">
+                    {grid[trackIndex].map((cellValue, stepIndex) => {
+                      const isActive = cellValue !== null;
+                      const isTie = cellValue === 'tie';
+                      const activeClasses = isTie 
+                        ? `${trackBaseColor} opacity-70 shadow-inner scale-[0.98] border-transparent text-white rounded-l-none border-l-0` 
+                        : `${trackBaseColor} shadow-inner scale-[0.97] border-transparent text-white`;
+
+                      return (
+                        <button
+                          key={`step-${trackIndex}-${stepIndex}`}
+                          onClick={() => toggleCell(trackIndex, stepIndex)}
+                          className={`flex-1 h-8 rounded-sm transition-all duration-150 border flex items-center justify-center ${stepIndex % 4 === 0 && !isActive ? 'border-stone-400' : 'border-stone-200'} ${isActive ? activeClasses : `bg-white hover:bg-stone-50`} ${currentStep === stepIndex && isPlaying ? 'ring-2 ring-blue-400 z-10' : ''}`}
+                        >
+                          {isActive && track.isMelodic && !isTie && (
+                            <span className="text-[8px] font-bold">{PENTATONIC_SCALE[cellValue].label.replace('高','')}</span>
+                          )}
+                          {isActive && track.isMelodic && isTie && (
+                            <span className="text-[10px] font-bold opacity-75">—</span>
+                          )}
                         </button>
-                    </div>
+                      );
+                    })}
+                  </div>
                 </div>
-            `).join('');
-            document.getElementById('copyright-intro').innerHTML = getCopyrightHTML();
-            lucide.createIcons();
-        }
+              );
+            })}
+          </div>
+        </div>
+      </section>
 
-        // 初始化影音欣賞
-        function renderMedia() {
-            const container = document.getElementById('videos-container');
-            let html = '';
-            
-            videos.forEach(video => {
-                let videoPlayerHtml = '';
-                
-                if (video.type === 'youtube') {
-                    videoPlayerHtml = `
-                        <iframe 
-                            class="absolute top-0 left-0 w-full h-full"
-                            src="${video.url}" 
-                            title="${video.title}"
-                            frameborder="0" 
-                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" 
-                            allowfullscreen>
-                        </iframe>
-                    `;
-                } else if (video.type === 'local') {
-                    if (localVideoSrc || !videoError) {
-                        videoPlayerHtml = `
-                            <video 
-                                class="absolute top-0 left-0 w-full h-full object-contain bg-black"
-                                src="${localVideoSrc || video.url}" 
-                                controls
-                                ${localVideoSrc ? 'autoplay' : ''}
-                                onerror="handleVideoError(this)"
-                            ></video>
-                        `;
-                    } else {
-                        videoPlayerHtml = `
-                            <div class="absolute top-0 left-0 w-full h-full flex flex-col items-center justify-center bg-gray-800 text-white p-4 text-center">
-                                <p class="text-sm text-gray-300 mb-4">請手動選擇您剛才上傳的影片檔案</p>
-                                <label class="cursor-pointer bg-red-600 hover:bg-red-700 px-5 py-2 rounded-full text-sm font-bold flex items-center transition-colors">
-                                    <i data-lucide="upload" class="mr-2 w-4 h-4"></i> 選擇本機影片
-                                    <input type="file" accept="video/*" class="hidden" onchange="handleFileUpload(event)" />
-                                </label>
-                            </div>
-                        `;
-                    }
-                }
+      {/* 區塊 3：控制台 */}
+      <section className="bg-stone-800 p-3 rounded-xl shadow-lg text-white space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <button
+            onClick={togglePlay}
+            className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg font-bold text-white transition-all shadow-md active:scale-95 ${
+              isPlaying ? 'bg-red-500 hover:bg-red-600' : 'bg-emerald-500 hover:bg-emerald-400'
+            }`}
+          >
+            {isPlaying ? <Square size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />}
+            {isPlaying ? '停止' : '播放'}
+          </button>
+          
+          <button onClick={loadExample} className="p-2.5 rounded-lg bg-stone-700 hover:bg-stone-600 transition-all text-stone-200" title="載入範例">
+            <FolderOpen size={18} />
+          </button>
+          <button onClick={clearGrid} className="p-2.5 rounded-lg bg-stone-700 hover:bg-stone-600 transition-all text-red-400" title="清空">
+            <Trash2 size={18} />
+          </button>
+        </div>
 
-                let fallbackBtn = '';
-                if (video.type === 'youtube' && video.ytUrl) {
-                    fallbackBtn = `
-                        <a href="${video.ytUrl}" target="_blank" rel="noopener noreferrer" class="text-xs text-red-600 font-bold hover:text-red-800 bg-red-50 px-3 py-1 rounded-full border border-red-100 transition-colors">
-                            無法播放？點此觀看
-                        </a>
-                    `;
-                } else if (video.type === 'local' && localVideoSrc) {
-                    fallbackBtn = `
-                        <button onclick="resetLocalVideo()" class="text-xs text-gray-500 font-bold hover:text-gray-700 underline">
-                            重新選擇影片
-                        </button>
-                    `;
-                }
+        <div className="grid grid-cols-2 gap-3 pt-2 border-t border-stone-700">
+          <div className="flex flex-col gap-1">
+            <label className="text-[10px] font-bold text-stone-400 flex items-center gap-1">
+              <Sliders size={12} /> 速度: {bpm}
+            </label>
+            <input type="range" min="60" max="160" value={bpm} onChange={(e) => setBpm(Number(e.target.value))} className="w-full h-1.5 bg-stone-700 rounded-lg appearance-none cursor-pointer accent-emerald-500" />
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className="text-[10px] font-bold text-stone-400 flex items-center gap-1">
+              <Waves size={12} /> 殘響
+            </label>
+            <input type="range" min="0" max="1" step="0.05" value={reverbLevel} onChange={(e) => setReverbLevel(Number(e.target.value))} className="w-full h-1.5 bg-stone-700 rounded-lg appearance-none cursor-pointer accent-blue-500" />
+          </div>
+        </div>
+      </section>
 
-                html += `
-                    <div class="bg-white rounded-xl shadow-sm overflow-hidden border border-gray-100">
-                        <div class="aspect-video bg-gray-900 w-full relative">
-                            ${videoPlayerHtml}
-                        </div>
-                        <div class="p-4 flex flex-col space-y-2">
-                            <h3 class="font-bold text-gray-800">${video.title}</h3>
-                            <div class="flex justify-between items-center">
-                                <span class="inline-block bg-gray-100 text-gray-600 text-xs px-2 py-1 rounded">來源: ${video.source}</span>
-                                ${fallbackBtn}
-                            </div>
-                        </div>
-                    </div>
-                `;
-            });
+    </div>
+  );
+}
 
-            container.innerHTML = html;
-            document.getElementById('copyright-media').innerHTML = getCopyrightHTML();
-            lucide.createIcons();
-        }
+function QuizGame() {
+  const [currentQ, setCurrentQ] = useState(0);
+  const [score, setScore] = useState(0);
+  const [showResult, setShowResult] = useState(false);
+  const [selectedOpt, setSelectedOpt] = useState(null);
+  const [isAnswered, setIsAnswered] = useState(false);
 
-        // 處理影片錯誤
-        window.handleVideoError = function(el) {
-            if (!localVideoSrc) {
-                videoError = true;
-                renderMedia();
-            }
-        };
+  const handleAnswer = (index) => {
+    if (isAnswered) return;
+    setSelectedOpt(index);
+    setIsAnswered(true);
+    
+    if (index === quizQuestions[currentQ].ans) {
+      setScore(prev => prev + 10);
+    }
 
-        // 處理本地影片上傳
-        window.handleFileUpload = function(e) {
-            const file = e.target.files[0];
-            if (file) {
-                const url = URL.createObjectURL(file);
-                localVideoSrc = url;
-                videoError = false;
-                renderMedia();
-            }
-        };
+    setTimeout(() => {
+      if (currentQ < quizQuestions.length - 1) {
+        setCurrentQ(prev => prev + 1);
+        setSelectedOpt(null);
+        setIsAnswered(false);
+      } else {
+        setShowResult(true);
+      }
+    }, 1200);
+  };
 
-        // 重置本地影片
-        window.resetLocalVideo = function() {
-            localVideoSrc = null;
-            videoError = true;
-            renderMedia();
-        };
+  const resetQuiz = () => {
+    setCurrentQ(0);
+    setScore(0);
+    setShowResult(false);
+    setSelectedOpt(null);
+    setIsAnswered(false);
+  };
 
-        // 渲染知識測驗
-        function renderQuiz() {
-            const container = document.getElementById('subtab-quiz');
-            
-            if (showResult) {
-                let resultTitle = "", resultDesc = "", resultColor = "";
-                if (score === 100) { resultTitle = "八音大神！"; resultDesc = "太神啦！你對客家八音的了解無人能敵！"; resultColor = "text-yellow-500"; }
-                else if (score >= 90) { resultTitle = "八音名家"; resultDesc = "非常厲害！你已經是八音領域的專家了！"; resultColor = "text-orange-500"; }
-                else if (score >= 80) { resultTitle = "八音高手"; resultDesc = "實力堅強！對八音有很深的認識喔！"; resultColor = "text-red-500"; }
-                else if (score >= 70) { resultTitle = "八音好手"; resultDesc = "表現不錯！繼續探索更多八音的奧秘吧！"; resultColor = "text-blue-500"; }
-                else if (score >= 60) { resultTitle = "八音達人(入門)"; resultDesc = "過關囉！具備基本的八音知識了！"; resultColor = "text-green-500"; }
-                else { resultTitle = "八音新手"; resultDesc = "再接再厲！多看幾次介紹一定能拿高分！"; resultColor = "text-gray-600"; }
+  if (showResult) {
+    return (
+      <div className="p-6 flex flex-col items-center justify-center min-h-[50vh] text-center">
+        <Award size={60} className="text-yellow-500 mb-4" />
+        <h2 className="text-3xl font-black mb-2">{score} 分</h2>
+        <p className="text-gray-600 mb-6 text-sm">測驗結束！對八音有更深的認識了嗎？</p>
+        <button onClick={resetQuiz} className="bg-red-600 text-white px-6 py-2 rounded-full font-bold flex items-center hover:bg-red-700 active:scale-95 transition-transform text-sm">
+          <RefreshCw size={16} className="mr-2" /> 再玩一次
+        </button>
+      </div>
+    );
+  }
 
-                container.innerHTML = `
-                    <div class="p-6 flex flex-col items-center justify-center min-h-[70vh] text-center fade-in">
-                        <i data-lucide="award" class="w-20 h-20 ${resultColor} mb-4"></i>
-                        <h2 class="text-4xl font-black mb-2">${score} 分</h2>
-                        <h3 class="text-2xl font-bold mb-2 ${resultColor}">${resultTitle}</h3>
-                        <p class="text-gray-600 mb-8">${resultDesc}</p>
-                        <button onclick="resetQuiz()" class="bg-red-600 text-white px-8 py-3 rounded-full font-bold flex items-center hover:bg-red-700 active:scale-95 transition-transform">
-                            <i data-lucide="refresh-cw" class="mr-2 w-5 h-5"></i> 再玩一次
-                        </button>
-                    </div>
-                `;
-                lucide.createIcons();
-                return;
-            }
+  const q = quizQuestions[currentQ];
 
-            const q = quizQuestions[currentQ];
-            let optionsHtml = '';
-            
-            q.options.forEach((opt, idx) => {
-                let btnClass = "w-full text-left p-4 rounded-xl border-2 font-medium transition-all ";
-                let iconHtml = "";
+  return (
+    <div className="p-4">
+      <div className="flex justify-between items-center mb-4 text-xs font-bold text-gray-500">
+        <span>題目 {currentQ + 1} / {quizQuestions.length}</span>
+        <span className="text-red-600">目前分數: {score}</span>
+      </div>
+      
+      <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 mb-4 min-h-[80px] flex items-center">
+        <h3 className="text-sm font-bold text-gray-800 leading-relaxed">{q.q}</h3>
+      </div>
 
-                if (!isAnswered) {
-                    btnClass += "border-gray-200 hover:border-red-300 bg-white text-gray-700 active:bg-gray-50";
-                } else {
-                    if (idx === q.ans) {
-                        btnClass += "border-green-500 bg-green-50 text-green-700";
-                        iconHtml = `<i data-lucide="check-circle" class="w-5 h-5 text-green-500"></i>`;
-                    } else if (idx === selectedOpt) {
-                        btnClass += "border-red-500 bg-red-50 text-red-700";
-                        iconHtml = `<i data-lucide="x-circle" class="w-5 h-5 text-red-500"></i>`;
-                    } else {
-                        btnClass += "border-gray-200 bg-white opacity-50";
-                    }
-                }
+      <div className="space-y-2">
+        {q.options.map((opt, idx) => {
+          let btnClass = "w-full text-left p-3 rounded-xl border-2 text-sm font-medium transition-all ";
+          if (!isAnswered) {
+            btnClass += "border-gray-200 hover:border-red-300 bg-white text-gray-700";
+          } else {
+            if (idx === q.ans) btnClass += "border-green-500 bg-green-50 text-green-700";
+            else if (idx === selectedOpt) btnClass += "border-red-500 bg-red-50 text-red-700";
+            else btnClass += "border-gray-200 bg-white opacity-50";
+          }
 
-                optionsHtml += `
-                    <button onclick="handleQuizAnswer(${idx})" class="${btnClass}" ${isAnswered ? 'disabled' : ''}>
-                        <div class="flex justify-between items-center">
-                            <span>${opt}</span>
-                            ${iconHtml}
-                        </div>
-                    </button>
-                `;
-            });
+          return (
+            <button key={idx} onClick={() => handleAnswer(idx)} className={btnClass} disabled={isAnswered}>
+              <div className="flex justify-between items-center">
+                <span>{opt}</span>
+                {isAnswered && idx === q.ans && <CheckCircle size={16} className="text-green-500" />}
+                {isAnswered && idx === selectedOpt && idx !== q.ans && <XCircle size={16} className="text-red-500" />}
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
-            container.innerHTML = `
-                <div class="p-5 fade-in">
-                    <div class="flex justify-between items-center mb-6 text-sm font-bold text-gray-500">
-                        <span>題目 ${currentQ + 1} / 10</span>
-                        <span class="text-red-600">目前分數: ${score}</span>
-                    </div>
-                    
-                    <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 mb-6 min-h-[120px] flex items-center">
-                        <h3 class="text-lg font-bold text-gray-800 leading-relaxed">${q.q}</h3>
-                    </div>
-
-                    <div class="space-y-3">
-                        ${optionsHtml}
-                    </div>
-                </div>
-            `;
-            lucide.createIcons();
-        }
-
-        // 處理測驗作答
-        window.handleQuizAnswer = function(idx) {
-            if (isAnswered) return;
-            selectedOpt = idx;
-            isAnswered = true;
-            
-            if (idx === quizQuestions[currentQ].ans) {
-                score += 10;
-            }
-
-            renderQuiz(); // 顯示正確/錯誤狀態
-
-            setTimeout(() => {
-                if (currentQ < quizQuestions.length - 1) {
-                    currentQ++;
-                    selectedOpt = null;
-                    isAnswered = false;
-                    renderQuiz();
-                } else {
-                    showResult = true;
-                    renderQuiz();
-                }
-            }, 1200);
-        };
-
-        // 重置測驗
-        window.resetQuiz = function() {
-            currentQ = 0;
-            score = 0;
-            showResult = false;
-            selectedOpt = null;
-            isAnswered = false;
-            renderQuiz();
-        };
-
-        // 渲染音樂網格
-        function renderMusicGrid() {
-            const container = document.getElementById('music-grid');
-            let html = '';
-            for (let r = 0; r < rows; r++) {
-                for (let c = 0; c < cols; c++) {
-                    const isActive = grid[r][c];
-                    const isHighlight = c === currentCol && isPlaying;
-                    
-                    let classes = "w-12 h-12 rounded-lg transition-all ";
-                    classes += isActive ? "bg-orange-500 shadow-inner " : "bg-orange-50 hover:bg-orange-100 ";
-                    classes += isHighlight ? "ring-4 ring-red-400 ring-opacity-50 transform scale-110 " : "";
-
-                    html += `<button onclick="toggleMusicCell(${r}, ${c})" class="${classes}"></button>`;
-                }
-            }
-            container.innerHTML = html;
-        }
-
-        // 切換音樂網格點擊
-        window.toggleMusicCell = function(r, c) {
-            grid[r][c] = !grid[r][c];
-            if(grid[r][c]) playTone(notes[r], 'triangle');
-            renderMusicGrid();
-        };
-
-        // 播放/停止 音樂遊戲
-        window.toggleMusicPlay = function() {
-            isPlaying = !isPlaying;
-            const btn = document.getElementById('play-music-btn');
-            
-            if (isPlaying) {
-                // UI 改變為停止
-                btn.className = "px-8 py-3 rounded-full font-bold flex items-center text-white bg-red-500";
-                btn.innerHTML = `<i data-lucide="x-circle" class="mr-2 w-5 h-5"></i> 停止`;
-                lucide.createIcons();
-
-                // 播放第一拍
-                grid.forEach((row, rIdx) => {
-                    if (row[0]) playTone(notes[rIdx], 'triangle');
-                });
-                renderMusicGrid();
-
-                musicInterval = setInterval(() => {
-                    currentCol = (currentCol + 1) % cols;
-                    grid.forEach((row, rIdx) => {
-                        if (row[currentCol]) playTone(notes[rIdx], 'triangle');
-                    });
-                    renderMusicGrid();
-                }, 400);
-
-            } else {
-                // UI 改變為播放
-                btn.className = "px-8 py-3 rounded-full font-bold flex items-center text-white bg-green-500";
-                btn.innerHTML = `<i data-lucide="play" class="mr-2 w-5 h-5"></i> 播放`;
-                lucide.createIcons();
-
-                clearInterval(musicInterval);
-                currentCol = 0;
-                renderMusicGrid();
-            }
-        };
-
-        // 清除音樂網格
-        window.clearMusicGrid = function() {
-            isPlaying = false;
-            clearInterval(musicInterval);
-            currentCol = 0;
-            grid = Array(rows).fill().map(() => Array(cols).fill(false));
-            
-            const btn = document.getElementById('play-music-btn');
-            btn.className = "px-8 py-3 rounded-full font-bold flex items-center text-white bg-green-500";
-            btn.innerHTML = `<i data-lucide="play" class="mr-2 w-5 h-5"></i> 播放`;
-            lucide.createIcons();
-
-            renderMusicGrid();
-        };
-
-        // --- 導覽列切換邏輯 ---
-        window.switchTab = function(tabName) {
-            // 重置所有按鈕樣式
-            document.querySelectorAll('nav button').forEach(btn => {
-                btn.className = "flex flex-col items-center justify-center p-2 w-full text-gray-400 hover:text-red-500 transition-colors";
-            });
-            // 啟用當前按鈕樣式
-            document.getElementById(`nav-${tabName}`).className = "flex flex-col items-center justify-center p-2 w-full text-red-700 transition-colors";
-
-            // 隱藏所有分頁
-            document.getElementById('tab-intro').classList.add('hidden-tab');
-            document.getElementById('tab-media').classList.add('hidden-tab');
-            document.getElementById('tab-master').classList.add('hidden-tab');
-
-            // 顯示當前分頁並確保觸發重繪（如有需要）
-            document.getElementById(`tab-${tabName}`).classList.remove('hidden-tab');
-
-            // 初始化特定分頁內容 (避免影音或遊戲一開始就在背景亂跑)
-            if (tabName === 'media') {
-                renderMedia();
-            }
-        };
-
-        // 達人頁面的子分頁切換
-        window.switchMasterSubTab = function(subName) {
-            // 樣式切換
-            const quizBtn = document.getElementById('subtab-quiz-btn');
-            const gameBtn = document.getElementById('subtab-game-btn');
-            
-            if (subName === 'quiz') {
-                quizBtn.className = "flex-1 py-3 text-sm font-bold border-b-2 border-red-600 text-red-600 transition-colors";
-                gameBtn.className = "flex-1 py-3 text-sm font-bold border-b-2 border-transparent text-gray-500 transition-colors";
-                document.getElementById('subtab-quiz').classList.remove('hidden-tab');
-                document.getElementById('subtab-game').classList.add('hidden-tab');
-            } else {
-                gameBtn.className = "flex-1 py-3 text-sm font-bold border-b-2 border-red-600 text-red-600 transition-colors";
-                quizBtn.className = "flex-1 py-3 text-sm font-bold border-b-2 border-transparent text-gray-500 transition-colors";
-                document.getElementById('subtab-game').classList.remove('hidden-tab');
-                document.getElementById('subtab-quiz').classList.add('hidden-tab');
-            }
-        };
-
-        // --- 初始化應用程式 ---
-        window.onload = () => {
-            initIntro();
-            renderQuiz();
-            renderMusicGrid();
-            switchTab('intro'); // 預設顯示首頁
-        };
-
-    </script>
-</body>
-</html>
+function Copyright() {
+  return (
+    <div className="mt-6 mb-2 p-3 border-t border-gray-200 text-[10px] text-gray-400 text-center leading-relaxed">
+      <p className="font-bold mb-1">版權聲明</p>
+      <p>本APP為教學使用，部分內容取材自公開學術網路資料，版權屬原作者所有。</p>
+    </div>
+  );
+}
